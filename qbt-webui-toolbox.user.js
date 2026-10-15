@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent WebUI — Créateur de torrent, MediaInfo, éditeur de trackers
 // @namespace    qbt-webui-toolbox
-// @version      12.3
+// @version      12.4
 // @homepageURL  https://github.com/Gusdezup/qbt-webui-toolbox
 // @supportURL   https://github.com/Gusdezup/qbt-webui-toolbox/issues
 // @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbt-webui-toolbox/main/qbt-webui-toolbox.user.js
@@ -120,6 +120,10 @@
     });
   }
   function setSavedTrackers(list) { GM_setValue('gtc_trackers', list); }
+  // Un tracker enregistré peut porter plusieurs URL d'announce (ex. V3X, C411 : deux domaines
+  // pour le même tracker), séparées par des espaces. Elles partent toutes dans le même tier,
+  // comme dans les .torrent de ces sites.
+  function splitUrls(s) { return String(s || '').split(/\s+/).filter(Boolean); }
   function getDefaultPath() { return GM_getValue('gtc_default_path', '/media/downloads'); }
   function setDefaultPath(p) { GM_setValue('gtc_default_path', p); }
 
@@ -748,7 +752,7 @@
         <div id="gtc-tracker-list" style="border:1px solid ${C.border};border-radius:4px;max-height:150px;overflow:auto;margin:4px 0 6px;"></div>
         <div style="display:flex;gap:6px;margin-bottom:6px;">
           <input id="gtc-tracker-name" style="${inputStyle('width:35%;box-sizing:border-box;')}" placeholder="Nom (ex: mon tracker perso)">
-          <input id="gtc-tracker-new" style="${inputStyle('flex:1;box-sizing:border-box;')}" placeholder="udp://tracker.example.org:1337/announce">
+          <input id="gtc-tracker-new" style="${inputStyle('flex:1;box-sizing:border-box;')}" placeholder="URL d'announce (plusieurs : séparées par un espace)">
         </div>
         <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px;">
           <input id="gtc-tracker-source" style="${inputStyle('flex:1;box-sizing:border-box;')}" placeholder="Source (optionnel, ex: HD-Forever) — pour un hash identique au site">
@@ -846,7 +850,7 @@
 
         const label = document.createElement('span');
         label.textContent = t.name + (t.source ? ' (' + t.source + ')' : '');
-        label.title = t.url + (t.source ? '\nSource: ' + t.source : '');
+        label.title = splitUrls(t.url).join('\n') + (t.source ? '\nSource: ' + t.source : '');
         label.style.cssText = `flex:1;cursor:pointer;color:${C.text};`;
         label.onclick = () => { chk.checked = !chk.checked; recomputeSourceField(); };
 
@@ -892,7 +896,7 @@
           okBtn.onclick = (ev) => {
             ev.preventDefault();
             const list = getSavedTrackers();
-            const url = urlInput.value.trim();
+            const url = splitUrls(urlInput.value).join(' ');
             if (!url) return;
             list[i] = { name: nameInput.value.trim() || url, url, source: sourceInput.value.trim(), enabled: enabledInput.checked };
             setSavedTrackers(list);
@@ -932,7 +936,7 @@
       const urlInput = overlay.querySelector('#gtc-tracker-new');
       const sourceInput = overlay.querySelector('#gtc-tracker-source');
       const enabledInput = overlay.querySelector('#gtc-tracker-enabled');
-      const url = urlInput.value.trim();
+      const url = splitUrls(urlInput.value).join(' ');
       if (!url) return;
       const name = nameInput.value.trim() || url;
       const source = sourceInput.value.trim();
@@ -949,7 +953,7 @@
       if (!sourcePath) { status.textContent = 'Chemin requis.'; return; }
       setDefaultPath(sourcePath);
 
-      const checkedTrackers = [...overlay.querySelectorAll('.gtc-tracker-chk:checked')].map(c => c.dataset.url);
+      const checkedTrackers = [...overlay.querySelectorAll('.gtc-tracker-chk:checked')].flatMap(c => splitUrls(c.dataset.url));
       const extraTrackers = overlay.querySelector('#gtc-trackers-extra').value
         .split('\n').map(s => s.trim()).filter(Boolean);
       const trackers = [...checkedTrackers, ...extraTrackers].join('|');
@@ -1304,8 +1308,55 @@
     };
   }
 
+  // ---------- Import / export des trackers enregistrés (JSON) ----------
+  // Permet de garder ses presets (avec passkeys) dans un fichier local hors dépôt, et de les
+  // recharger sur un autre navigateur. Import = fusion par nom : un tracker du même nom est
+  // remplacé, les autres sont conservés.
+  function openTrackersImportExport() {
+    if (document.getElementById('gtc-io-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'gtc-io-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100003;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+      <div style="${panelStyle('620px')}">
+        <h3 style="margin-top:0;">Trackers enregistrés — import / export</h3>
+        <div style="color:${C.muted};margin-bottom:6px;">Contenu actuel ci-dessous (à copier pour sauvegarder). Pour importer : colle un tableau JSON à la place, puis « Importer » (fusion par nom).</div>
+        <textarea id="gtc-io-text" spellcheck="false" style="${inputStyle('width:100%;box-sizing:border-box;height:300px;font-family:monospace;font-size:12px;')}"></textarea>
+        <div id="gtc-io-status" style="min-height:16px;margin-top:8px;color:${C.muted};"></div>
+        <div style="text-align:right;margin-top:6px;">
+          <button id="gtc-io-close" type="button" style="${btnStyle()}">Fermer</button>
+          <button id="gtc-io-import" type="button" style="${btnStyle()}">Importer</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const text = overlay.querySelector('#gtc-io-text');
+    const status = overlay.querySelector('#gtc-io-status');
+    text.value = JSON.stringify(getSavedTrackers(), null, 2);
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector('#gtc-io-close').onclick = () => overlay.remove();
+    overlay.querySelector('#gtc-io-import').onclick = () => {
+      let data;
+      try { data = JSON.parse(text.value); } catch (e) { status.textContent = 'JSON invalide : ' + e.message; return; }
+      if (!Array.isArray(data)) { status.textContent = 'Il faut un tableau JSON [ {…}, {…} ].'; return; }
+      const list = getSavedTrackers();
+      let added = 0, replaced = 0;
+      for (const t of data) {
+        if (!t || typeof t !== 'object') continue;
+        const url = splitUrls(Array.isArray(t.url) ? t.url.join(' ') : t.url).join(' ');
+        if (!url) continue;
+        const entry = { name: String(t.name || url).trim(), url, source: String(t.source || '').trim(), enabled: t.enabled !== false };
+        const i = list.findIndex(x => x.name === entry.name);
+        if (i >= 0) { list[i] = entry; replaced++; } else { list.push(entry); added++; }
+      }
+      setSavedTrackers(list);
+      text.value = JSON.stringify(list, null, 2);
+      status.textContent = `${added} ajouté(s), ${replaced} remplacé(s). Rouvre le créateur pour les voir.`;
+    };
+  }
+
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('Réglages…', openSettingsDialog);
+    GM_registerMenuCommand('Trackers : importer / exporter…', openTrackersImportExport);
   }
 
   addButton();
