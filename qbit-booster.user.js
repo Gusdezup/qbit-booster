@@ -1,12 +1,12 @@
 // ==UserScript==
-// @name         qBittorrent WebUI — Créateur de torrent, MediaInfo, éditeur de trackers
-// @namespace    qbt-webui-toolbox
-// @version      12.4
-// @homepageURL  https://github.com/Gusdezup/qbt-webui-toolbox
-// @supportURL   https://github.com/Gusdezup/qbt-webui-toolbox/issues
-// @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbt-webui-toolbox/main/qbt-webui-toolbox.user.js
-// @updateURL    https://raw.githubusercontent.com/Gusdezup/qbt-webui-toolbox/main/qbt-webui-toolbox.user.js
-// @description  Remplace le créateur de torrent natif (taille de pièce, privé par défaut, trackers enregistrés, champ source, navigateur de fichiers), ajoute un éditeur de trackers en masse et un bouton MediaInfo optionnel (via un sidecar mediainfo-api). Réglages via le menu de l'extension.
+// @name         Qbit Booster
+// @namespace    qbit-booster
+// @version      13.0
+// @homepageURL  https://github.com/Gusdezup/qbit-booster
+// @supportURL   https://github.com/Gusdezup/qbit-booster/issues
+// @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
+// @updateURL    https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
+// @description  Améliore le WebUI qBittorrent : créateur de torrent (taille de pièce, privé par défaut, trackers enregistrés, champ source, navigateur de fichiers), éditeur de trackers en masse, réinitialisation des filtres en un clic et MediaInfo optionnel (via le sidecar qbit-booster-mediainfo). Réglages via le menu de l'extension.
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
 // @grant        GM_getValue
@@ -200,7 +200,7 @@
         entries.slice(0, 30).forEach(entry => {
           const item = document.createElement('div');
           const sizeLabel = (!entry.isDir && entry.size != null) ? `  ·  ${formatSize(entry.size)}` : '';
-          item.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name + sizeLabel;
+          item.textContent = (entry.isDir ? '\u{1F4C1} ' : '\u{1F4C4} ') + entry.name + sizeLabel;
           item.style.cssText = `padding:5px 8px;cursor:pointer;color:${C.text};`;
           item.onmouseenter = () => item.style.background = C.hover;
           item.onmouseleave = () => item.style.background = '';
@@ -260,7 +260,7 @@
         [...folders, ...files].forEach(entry => {
           const row = document.createElement('div');
           const sizeLabel = (!entry.isDir && entry.size != null) ? `  ·  ${formatSize(entry.size)}` : '';
-          row.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name + sizeLabel;
+          row.textContent = (entry.isDir ? '\u{1F4C1} ' : '\u{1F4C4} ') + entry.name + sizeLabel;
           row.style.cssText = `padding:6px 10px;cursor:pointer;border-bottom:1px solid ${C.border};color:${C.text};`;
           row.onmouseenter = () => row.style.background = C.hover;
           row.onmouseleave = () => row.style.background = '';
@@ -414,7 +414,7 @@
       listEl.innerHTML = '';
       files.forEach(f => {
         const row = document.createElement('div');
-        row.textContent = '📄 ' + f.name + '  ·  ' + formatSize(f.size);
+        row.textContent = '\u{1F4C4} ' + f.name + '  ·  ' + formatSize(f.size);
         row.style.cssText = `padding:6px 10px;cursor:pointer;border-bottom:1px solid ${C.border};color:${C.text};`;
         row.onmouseenter = () => row.style.background = C.hover;
         row.onmouseleave = () => row.style.background = '';
@@ -1173,6 +1173,83 @@
     return true;
   }
 
+  // ---------- Réinitialisation des filtres de la barre latérale ----------
+  // Les filtres (État, Catégories, Étiquettes, Trackers) sont des variables internes de
+  // client.js, inaccessibles depuis le contexte isolé de l'extension. Mais le WebUI écoute les
+  // clics délégués sur #Filters_pad : cliquer sur l'entrée « Tous » de chaque liste déclenche
+  // exactement le comportement natif (mémorisation dans localPreferences, rafraîchissement).
+  // L'entrée « Tous » est toujours la première <li> de chaque liste.
+  const FILTER_LIST_IDS = ['statusFilterList', 'categoryFilterList', 'tagFilterList', 'trackerFilterList'];
+
+  function activeFilterLists() {
+    return FILTER_LIST_IDS.filter(id => {
+      const list = document.getElementById(id);
+      if (!list) return false;
+      const selected = list.querySelector('li.selectedFilter');
+      return !!selected && selected !== list.querySelector('li');
+    });
+  }
+
+  function resetAllFilters() {
+    activeFilterLists().forEach(id => {
+      const allItem = document.getElementById(id).querySelector('li');
+      if (allItem) allItem.click();
+    });
+    updateResetFiltersButton();
+  }
+
+  // Entonnoir barré : gris quand tout est sur « Tous », orange dès qu'un filtre est actif.
+  function filterIconDataUri(color) {
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">' +
+      `<circle cx="12" cy="12" r="10" fill="${color}"/>` +
+      '<path d="M7 7.5h10l-3.8 4.6v4.2l-2.4 1.2v-5.4z" fill="#ffffff"/>' +
+      '<path d="M6.5 17.5L17.5 6.5" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    );
+  }
+  const RESET_FILTERS_ICON_IDLE = filterIconDataUri('#6b6b6b');
+  const RESET_FILTERS_ICON_ACTIVE = filterIconDataUri('#f29900');
+
+  function updateResetFiltersButton() {
+    const img = document.querySelector('#gtc-resetfilters-button img');
+    if (!img) return;
+    const active = activeFilterLists();
+    const src = active.length ? RESET_FILTERS_ICON_ACTIVE : RESET_FILTERS_ICON_IDLE;
+    if (img.src !== src) img.src = src;
+    const names = { statusFilterList: 'État', categoryFilterList: 'Catégorie', tagFilterList: 'Étiquette', trackerFilterList: 'Tracker' };
+    img.title = active.length
+      ? 'Réinitialiser les filtres (actifs : ' + active.map(id => names[id]).join(', ') + ')'
+      : 'Réinitialiser les filtres (aucun actif)';
+  }
+
+  function insertResetFiltersButton() {
+    if (document.getElementById('gtc-resetfilters-button')) return true;
+    const anchor = document.getElementById('gtc-trackereditor-button');
+    const pad = document.getElementById('Filters_pad');
+    if (!anchor || !pad) return false;
+    const a = document.createElement('a');
+    a.id = 'gtc-resetfilters-button';
+    a.style.cursor = 'pointer';
+    const img = document.createElement('img');
+    img.className = 'mochaToolButton';
+    img.alt = 'Réinitialiser les filtres';
+    img.width = 24;
+    img.height = 24;
+    img.src = RESET_FILTERS_ICON_IDLE;
+    a.appendChild(img);
+    a.onclick = resetAllFilters;
+    anchor.after(a);
+    // Suit les changements de sélection (clic manuel, listes reconstruites à chaque rafraîchissement).
+    let pending = false;
+    new MutationObserver(() => {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => { pending = false; updateResetFiltersButton(); });
+    }).observe(pad, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
+    updateResetFiltersButton();
+    return true;
+  }
+
   function addFloatingFallback() {
     if (document.getElementById('gtc-open-btn')) return;
     const btn = document.createElement('button');
@@ -1193,7 +1270,8 @@
     const hijacked = hijackTorrentCreatorButton();
     const mediaInfoAdded = insertMediaInfoButton();
     const trackerEditorAdded = insertTrackerEditorButton();
-    if (hijacked && mediaInfoAdded && trackerEditorAdded) return;
+    const resetFiltersAdded = insertResetFiltersButton();
+    if (hijacked && mediaInfoAdded && trackerEditorAdded && resetFiltersAdded) return;
     // #torrentCreatorButton n'existe pas encore (chargement JS de qBittorrent en cours) : on
     // réessaie brièvement, et seulement s'il n'apparaît vraiment jamais on bascule sur le
     // bouton flottant de secours (pour le créateur de torrent uniquement — les deux autres ont
@@ -1204,7 +1282,8 @@
       const a = hijackTorrentCreatorButton();
       const b = insertMediaInfoButton();
       const c = insertTrackerEditorButton();
-      if ((a && b && c) || tries > 20) {
+      const d = insertResetFiltersButton();
+      if ((a && b && c && d) || tries > 20) {
         clearInterval(iv);
         if (!document.getElementById('torrentCreatorButton')) addFloatingFallback();
       }

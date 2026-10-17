@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mediainfo-api : petit service HTTP qui renvoie la sortie texte de `mediainfo` pour un fichier.
+"""qbit-booster-mediainfo : petit service HTTP qui renvoie la sortie texte de `mediainfo` pour un fichier.
 
 GET /mediainfo?path=/media/...   -> 200 text/plain (sortie mediainfo)
 GET /health                      -> 200 "ok"
@@ -22,7 +22,7 @@ def is_allowed(real_path: str) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "mediainfo-api"
+    server_version = "qbit-booster-mediainfo"
 
     def _send(self, code: int, text: str) -> None:
         body = text.encode("utf-8")
@@ -61,5 +61,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"mediainfo-api : port {PORT}, ALLOWED_ROOT={ALLOWED_ROOT}", flush=True)
+    print(f"qbit-booster-mediainfo : port {PORT}, ALLOWED_ROOT={ALLOWED_ROOT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
