@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Qbit Booster
 // @namespace    qbit-booster
-// @version      13.0
+// @version      13.1
 // @homepageURL  https://github.com/Gusdezup/qbit-booster
 // @supportURL   https://github.com/Gusdezup/qbit-booster/issues
 // @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
@@ -1179,19 +1179,32 @@
   // clics délégués sur #Filters_pad : cliquer sur l'entrée « Tous » de chaque liste déclenche
   // exactement le comportement natif (mémorisation dans localPreferences, rafraîchissement).
   // L'entrée « Tous » est toujours la première <li> de chaque liste.
+  // La case de recherche (#torrentsFilterInput) est aussi un filtre : client.js rafraîchit la
+  // liste sur l'événement « input » ; on la vide puis on émet cet événement nous-mêmes (changer
+  // .value par script ne le déclenche pas).
   const FILTER_LIST_IDS = ['statusFilterList', 'categoryFilterList', 'tagFilterList', 'trackerFilterList'];
+  const SEARCH_INPUT_ID = 'torrentsFilterInput';
 
   function activeFilterLists() {
-    return FILTER_LIST_IDS.filter(id => {
+    const active = FILTER_LIST_IDS.filter(id => {
       const list = document.getElementById(id);
       if (!list) return false;
       const selected = list.querySelector('li.selectedFilter');
       return !!selected && selected !== list.querySelector('li');
     });
+    const search = document.getElementById(SEARCH_INPUT_ID);
+    if (search && search.value !== '') active.push(SEARCH_INPUT_ID);
+    return active;
   }
 
   function resetAllFilters() {
     activeFilterLists().forEach(id => {
+      if (id === SEARCH_INPUT_ID) {
+        const search = document.getElementById(id);
+        search.value = '';
+        search.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
       const allItem = document.getElementById(id).querySelector('li');
       if (allItem) allItem.click();
     });
@@ -1216,7 +1229,7 @@
     const active = activeFilterLists();
     const src = active.length ? RESET_FILTERS_ICON_ACTIVE : RESET_FILTERS_ICON_IDLE;
     if (img.src !== src) img.src = src;
-    const names = { statusFilterList: 'État', categoryFilterList: 'Catégorie', tagFilterList: 'Étiquette', trackerFilterList: 'Tracker' };
+    const names = { statusFilterList: 'État', categoryFilterList: 'Catégorie', tagFilterList: 'Étiquette', trackerFilterList: 'Tracker', [SEARCH_INPUT_ID]: 'Recherche' };
     img.title = active.length
       ? 'Réinitialiser les filtres (actifs : ' + active.map(id => names[id]).join(', ') + ')'
       : 'Réinitialiser les filtres (aucun actif)';
@@ -1246,6 +1259,9 @@
       pending = true;
       requestAnimationFrame(() => { pending = false; updateResetFiltersButton(); });
     }).observe(pad, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
+    // La case de recherche est hors de #Filters_pad : on suit sa saisie séparément.
+    const search = document.getElementById(SEARCH_INPUT_ID);
+    if (search) search.addEventListener('input', updateResetFiltersButton);
     updateResetFiltersButton();
     return true;
   }
