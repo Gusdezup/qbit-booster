@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Qbit Booster
 // @namespace    qbit-booster
-// @version      13.1
+// @version      13.5
 // @homepageURL  https://github.com/Gusdezup/qbit-booster
 // @supportURL   https://github.com/Gusdezup/qbit-booster/issues
 // @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
@@ -20,15 +20,22 @@
 // INSTALLATION : ajoute l'adresse de TON WebUI qBittorrent dans les réglages du script de
 // l'extension (Violentmonkey : onglet Paramètres > « @match » personnalisé ; Tampermonkey :
 // Paramètres > « Correspondances utilisateur »), par ex. http://192.168.1.10:8080/*
+// (WebUI sous un sous-chemin, ex. seedbox : https://xxx.usbx.me/qbittorrent/*)
 // Ce réglage survit aux mises à jour du script. Aucun identifiant n'est nécessaire : le script
 // tourne dans la page du WebUI et réutilise la session déjà ouverte.
 
 (function () {
   'use strict';
 
+  // Chemin de l'API RELATIF à la page (comme le WebUI natif) : fonctionne aussi quand le WebUI
+  // est servi sous un sous-chemin derrière un reverse proxy (seedbox, ex. /qbittorrent/).
+  // Un chemin absolu « /api/v2/ » partirait à la racine du domaine, hors de qBittorrent.
+  const API_BASE = 'api/v2/';
+
   // ---------- Réglages (persistés via GM_setValue) ----------
   const DEFAULT_SETTINGS = {
     mediainfoApi: '',            // vide = bouton MediaInfo masqué
+    defaultPath: '/media/downloads', // dossier de départ tant qu'aucun chemin n'a été utilisé
     pieceSize: 4194304,          // 4 MiB ('' = Auto)
     format: 'v1',
     private: true,
@@ -107,7 +114,7 @@
   }
 
   function apiFetch(path, options = {}) {
-    return fetch('/api/v2/' + path, { credentials: 'same-origin', ...options })
+    return fetch(API_BASE + path, { credentials: 'same-origin', ...options })
       .then(r => { if (!r.ok) throw new Error(r.status + ' ' + r.statusText); return r; });
   }
 
@@ -124,7 +131,8 @@
   // pour le même tracker), séparées par des espaces. Elles partent toutes dans le même tier,
   // comme dans les .torrent de ces sites.
   function splitUrls(s) { return String(s || '').split(/\s+/).filter(Boolean); }
-  function getDefaultPath() { return GM_getValue('gtc_default_path', '/media/downloads'); }
+  // Dernier chemin utilisé, sinon le dossier de départ des Réglages.
+  function getDefaultPath() { return GM_getValue('gtc_default_path', '') || getSettings().defaultPath || '/'; }
   function setDefaultPath(p) { GM_setValue('gtc_default_path', p); }
 
   // ---------- API app/getDirectoryContent (fallback POST puis GET) ----------
@@ -136,7 +144,7 @@
     let lastError;
     for (const a of attempts) {
       try {
-        const res = await fetch('/api/v2/app/getDirectoryContent' + (a.qs || ''), {
+        const res = await fetch(API_BASE + 'app/getDirectoryContent' + (a.qs || ''), {
           method: a.method, credentials: 'same-origin', body: a.body,
         });
         if (res.ok) return await res.json();
@@ -158,6 +166,9 @@
   function normalizeEntries(data, currentPath) {
     if (!Array.isArray(data)) return [];
     const base = currentPath.replace(/\/+$/, '');
+    // Tri : dossiers d'abord, puis ordre alphabétique (insensible à la casse, numérique : « S2 » avant « S10 »).
+    const byName = (a, b) => (b.isDir - a.isDir) ||
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
     return data.map(e => {
       // Ancien format (sans withMetadata) : simple chaîne = chemin complet d'un dossier
       if (typeof e === 'string') {
@@ -170,7 +181,7 @@
       const path = base + '/' + name;
       const isDir = (e.type || '').toLowerCase() !== 'file';
       return { name, path, isDir, size: e.size };
-    });
+    }).sort(byName);
   }
 
   // ---------- Autocomplétion sur le champ chemin source ----------
@@ -220,7 +231,11 @@
 
   // ---------- Navigateur de fichiers/dossiers ----------
   function openDirectoryBrowser(startPath, onChoose) {
-    let current = startPath || getDefaultPath() || '/';
+    let current = (startPath || getDefaultPath() || '/').replace(/(.)\/+$/, '$1');
+    // Tant qu'aucun dossier n'a pu être lu, un chemin illisible (fichier, dossier supprimé…)
+    // remonte au parent au lieu d'afficher une erreur. Cas typique : chemin source prérempli
+    // avec un torrent mono-fichier (.mkv).
+    let climbing = true;
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100000;display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
@@ -245,6 +260,7 @@
       try {
         const data = await fetchDirectoryContent(current);
         const entries = normalizeEntries(data, current);
+        climbing = false;
         list.innerHTML = '';
 
         const up = document.createElement('div');
@@ -278,6 +294,11 @@
           list.appendChild(empty);
         }
       } catch (e) {
+        if (climbing && current !== '/') {
+          current = current.replace(/\/[^/]+\/?$/, '') || '/';
+          render();
+          return;
+        }
         list.textContent = 'Erreur: ' + e.message;
       }
     }
@@ -516,8 +537,10 @@
     let errors = 0, trackersSeen = 0;
     function addTrackers(t, trackers) {
       (trackers || []).forEach(tr => {
-        const url = tr && tr.url;
-        if (!url || url.startsWith('** [')) return; // DHT / PeX / LSD
+        // Selon la version, une entrée est un objet {url, …} ou directement une chaîne.
+        const url = String(typeof tr === 'string' ? tr : (tr && tr.url) || '').trim();
+        // Seules les vraies URL d'announce comptent (exclut « ** [DHT] », « [PeX] », « [LSD] ** »).
+        if (!/^(https?|udp|wss?):\/\//i.test(url)) return;
         trackersSeen++;
         if (wantedHost) {
           let h;
@@ -530,9 +553,12 @@
       });
     }
 
-    const inline = infos.length > 0 && infos.every(t => Array.isArray(t.trackers));
-    if (inline) {
+    // Le champ « trackers » inline n'est utilisé que s'il contient vraiment des URL : certaines
+    // versions renvoient un champ absent, vide ou d'un autre format. Sinon, scan torrent par torrent.
+    if (infos.length > 0 && infos.every(t => Array.isArray(t.trackers))) {
       infos.forEach(t => addTrackers(t, t.trackers));
+    }
+    if (trackersSeen > 0) {
       if (onProgress) onProgress(infos.length, infos.length);
     } else {
       const CONCURRENCY = 15;
@@ -556,11 +582,16 @@
 
   // Détecte le filtre tracker natif sélectionné dans la sidebar (id = host du tracker ; les
   // filtres spéciaux "Tous"/"Sans tracker"/etc. ont un id au format UUID, à ignorer).
+  // En 5.0.x, l'id n'est pas le host mais un hash numérique de celui-ci : on lit alors le host
+  // dans le libellé (« tracker.example.org (16) »). Les filtres spéciaux (« Tous », « Sans
+  // tracker »…) ne ressemblent pas à un nom de domaine et renvoient null.
   function getSelectedTrackerHost() {
     const li = document.querySelector('#trackerFilterList li.selectedFilter');
-    if (!li || !li.id) return null;
-    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(li.id)) return null;
-    return li.id;
+    if (!li) return null;
+    const isHost = s => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(s);
+    if (li.id && isHost(li.id)) return li.id;
+    const label = li.textContent.trim().replace(/\s*\(\d+\)\s*$/, '');
+    return isHost(label) ? label : null;
   }
 
   async function openBulkTrackerEditor(scope) {
@@ -1020,7 +1051,7 @@
         // (torrent déjà présent, cross-seed, tracker pas encore enregistré...), pas que la
         // génération du .torrent a échoué. Le fichier existe généralement quand même : on
         // propose toujours le téléchargement, quel que soit le statut final.
-        const url = '/api/v2/torrentcreator/torrentFile?taskID=' + encodeURIComponent(taskID);
+        const url = API_BASE + 'torrentcreator/torrentFile?taskID=' + encodeURIComponent(taskID);
         const filename = computeTorrentFilename(sourcePath, isDirHint);
         status.innerHTML = '';
         const label = document.createElement('div');
@@ -1073,21 +1104,50 @@
     '<path d="M14 2v6h6"/><line x1="12" y1="12" x2="12" y2="18"/><line x1="9" y1="15" x2="15" y2="15"/></svg>'
   );
 
+  // Point d'ancrage des boutons ajoutés : le bouton natif « Créateur de torrent » s'il existe,
+  // sinon notre propre bouton créateur (WebUI sans créateur natif, ex. qBittorrent 5.0.x).
+  function creatorAnchor() {
+    return document.getElementById('torrentCreatorButton') || document.getElementById('gtc-creator-button');
+  }
+
   // Détourne le bouton natif "Créateur de torrent" (#torrentCreatorButton) au lieu d'en ajouter
   // un à côté : même icône, même position, même style — y compris après un changement de thème,
   // puisque c'est le vrai élément natif (pas une copie) et son icône vient du thème actif.
   // L'écouteur est posé en phase de capture + stopImmediatePropagation pour empêcher le
   // gestionnaire natif de qBittorrent de s'exécuter, quelle que soit sa méthode d'attache.
+  // Si le WebUI n'a pas de bouton natif, on insère le nôtre dans la barre d'outils.
   function hijackTorrentCreatorButton() {
     const el = document.getElementById('torrentCreatorButton');
-    if (!el) return false;
-    if (el.dataset.gtcHijacked) return true;
-    el.dataset.gtcHijacked = '1';
-    el.addEventListener('click', (e) => {
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      buildDialog();
-    }, true);
+    if (el) {
+      const own = document.getElementById('gtc-creator-button');
+      if (own) own.remove();
+      if (!el.dataset.gtcHijacked) {
+        el.dataset.gtcHijacked = '1';
+        el.addEventListener('click', (e) => {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          buildDialog();
+        }, true);
+      }
+      return true;
+    }
+    if (document.getElementById('gtc-creator-button')) return true;
+    const toolbar = document.getElementById('mochaToolbar');
+    if (!toolbar) return false;
+    const a = document.createElement('a');
+    a.id = 'gtc-creator-button';
+    a.style.cursor = 'pointer';
+    const img = document.createElement('img');
+    img.className = 'mochaToolButton';
+    img.title = 'Créer un torrent';
+    img.alt = 'Créer un torrent';
+    img.width = 24;
+    img.height = 24;
+    img.src = ICON_DATAURI;
+    a.appendChild(img);
+    a.onclick = buildDialog;
+    const ref = document.getElementById('preferencesButton');
+    if (ref) ref.before(a); else toolbar.appendChild(a);
     return true;
   }
 
@@ -1101,12 +1161,12 @@
   );
 
   // Pas de bouton natif équivalent à détourner ici : on en insère un vrai, juste après le
-  // bouton "Créateur de torrent" natif, avec la même structure <a><img class="mochaToolButton">.
+  // bouton "Créateur de torrent", avec la même structure <a><img class="mochaToolButton">.
   function insertMediaInfoButton() {
     const existing = document.getElementById('gtc-mediainfo-button');
     if (!getMediaInfoApi()) { if (existing) existing.remove(); return true; }
     if (existing) return true;
-    const anchor = document.getElementById('torrentCreatorButton');
+    const anchor = creatorAnchor();
     if (!anchor) return false;
     const a = document.createElement('a');
     a.id = 'gtc-mediainfo-button';
@@ -1149,7 +1209,7 @@
 
   function insertTrackerEditorButton() {
     if (document.getElementById('gtc-trackereditor-button')) return true;
-    const anchor = document.getElementById('gtc-mediainfo-button') || document.getElementById('torrentCreatorButton');
+    const anchor = document.getElementById('gtc-mediainfo-button') || creatorAnchor();
     if (!anchor) return false;
     const a = document.createElement('a');
     a.id = 'gtc-trackereditor-button';
@@ -1288,10 +1348,10 @@
     const trackerEditorAdded = insertTrackerEditorButton();
     const resetFiltersAdded = insertResetFiltersButton();
     if (hijacked && mediaInfoAdded && trackerEditorAdded && resetFiltersAdded) return;
-    // #torrentCreatorButton n'existe pas encore (chargement JS de qBittorrent en cours) : on
-    // réessaie brièvement, et seulement s'il n'apparaît vraiment jamais on bascule sur le
-    // bouton flottant de secours (pour le créateur de torrent uniquement — les deux autres ont
-    // besoin du bouton natif comme point d'ancrage et n'ont pas de repli).
+    // La barre d'outils n'est pas encore prête (chargement JS de qBittorrent en cours) : on
+    // réessaie brièvement, et seulement si aucun point d'ancrage n'apparaît jamais (ni bouton
+    // natif, ni barre d'outils) on bascule sur le bouton flottant de secours (pour le créateur
+    // de torrent uniquement — les autres boutons ont besoin d'un ancrage et n'ont pas de repli).
     let tries = 0;
     const iv = setInterval(() => {
       tries++;
@@ -1301,7 +1361,7 @@
       const d = insertResetFiltersButton();
       if ((a && b && c && d) || tries > 20) {
         clearInterval(iv);
-        if (!document.getElementById('torrentCreatorButton')) addFloatingFallback();
+        if (!creatorAnchor()) addFloatingFallback();
       }
     }, 300);
   }
@@ -1345,6 +1405,9 @@
         </div>
         <div id="gtc-set-mi-status" style="min-height:16px;font-size:12px;color:${C.muted};margin-bottom:10px;"></div>
 
+        <label>Dossier de départ du créateur <span style="color:${C.muted};">(chemin vu par qBittorrent)</span></label>
+        <input id="gtc-set-path" style="${inputStyle('width:100%;box-sizing:border-box;margin:4px 0 10px;')}" placeholder="/media/downloads" autocomplete="off">
+
         <label>Taille des pièces par défaut</label>
         <select id="gtc-set-piece" style="${inputStyle('width:100%;margin:4px 0 10px;')}">${pieceSizeOptions(s.pieceSize)}</select>
 
@@ -1364,6 +1427,8 @@
     document.body.appendChild(overlay);
     const miInput = overlay.querySelector('#gtc-set-mi');
     miInput.value = s.mediainfoApi || ''; // via .value : pas d'injection dans le HTML
+    const pathInput = overlay.querySelector('#gtc-set-path');
+    pathInput.value = s.defaultPath || '';
     overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
     overlay.querySelector('#gtc-set-cancel').onclick = () => overlay.remove();
 
@@ -1388,8 +1453,17 @@
       const err = validateHttpUrl(mediainfoApi);
       if (err) { overlay.querySelector('#gtc-set-error').textContent = err; return; }
       const piece = overlay.querySelector('#gtc-set-piece').value;
+      const defaultPath = pathInput.value.trim();
+      if (defaultPath && !defaultPath.startsWith('/')) {
+        overlay.querySelector('#gtc-set-error').textContent = 'Le dossier de départ doit être un chemin absolu (commence par /)';
+        return;
+      }
+      // Nouveau dossier de départ : il remplace aussi le dernier chemin mémorisé, pour prendre
+      // effet dès la prochaine ouverture du créateur.
+      if (defaultPath !== (s.defaultPath || '')) setDefaultPath(defaultPath);
       setSettings({
         mediainfoApi,
+        defaultPath,
         pieceSize: piece === '' ? '' : Number(piece),
         format: overlay.querySelector('#gtc-set-format').value,
         private: overlay.querySelector('#gtc-set-private').checked,

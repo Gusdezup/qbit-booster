@@ -2,7 +2,7 @@
 
 Userscript (Violentmonkey / Tampermonkey) qui ajoute au WebUI de qBittorrent :
 
-- **Créateur de torrent amélioré** — remplace la fenêtre native : taille de pièce, format v1/v2/hybride, privé par défaut, trackers enregistrés (nom, URL, champ *source*), navigateur de fichiers avec autocomplétion, préremplissage depuis le torrent sélectionné, téléchargement du `.torrent`.
+- **Créateur de torrent amélioré** — remplace la fenêtre native (ou ajoute le bouton si le WebUI n'en a pas) : taille de pièce, format v1/v2/hybride, privé par défaut, trackers enregistrés (nom, URL, champ *source*), navigateur de fichiers avec autocomplétion, préremplissage depuis le torrent sélectionné, téléchargement du `.torrent`.
 - **Éditeur de trackers en masse** — remplace une URL d'announce sur tous les torrents concernés (sélection, filtre tracker de la barre latérale, ou toute la bibliothèque).
 - **Réinitialisation des filtres** — un clic remet État, Catégories, Étiquettes et Trackers sur « Tous » ; l'icône passe en orange dès qu'un filtre est actif (survol = lesquels).
 - **MediaInfo** *(optionnel)* — affiche la sortie `mediainfo` d'un fichier d'un torrent, copie ou export `.nfo`. Nécessite le petit conteneur `qbit-booster-mediainfo`.
@@ -12,6 +12,7 @@ Userscript (Violentmonkey / Tampermonkey) qui ajoute au WebUI de qBittorrent :
 - qBittorrent **5.0+** (API `torrentcreator`). **5.1+** recommandé : l'éditeur de trackers récupère tout en une seule requête (sinon, repli sur un scan torrent par torrent, plus lent).
 - Violentmonkey (recommandé) ou Tampermonkey.
 - Aucun identifiant à fournir : le script tourne dans la page du WebUI et réutilise ta session.
+- Fonctionne aussi derrière un reverse proxy / sur seedbox, y compris quand le WebUI est servi sous un sous-chemin (ex. `/qbittorrent/`).
 
 ## Installation
 
@@ -20,7 +21,7 @@ Userscript (Violentmonkey / Tampermonkey) qui ajoute au WebUI de qBittorrent :
    - **Violentmonkey** : tableau de bord → *Modifier* le script → onglet *Paramètres* → *Règles @match* → ajoute par ex. `http://192.168.1.10:8080/*` (garde « Garder l'original » coché) → Enregistrer.
    - **Tampermonkey** : *Paramètres* du script → *Correspondances utilisateur* → même valeur.
 
-   Le `/*` final est obligatoire. Ce réglage survit aux mises à jour.
+   Le `/*` final est obligatoire. Sur une seedbox, mets l'adresse complète avec le sous-chemin, par ex. `https://xxx.usbx.me/qbittorrent/*`. Ce réglage survit aux mises à jour.
 3. Recharge le WebUI.
 
 Les mises à jour sont automatiques (via `@updateURL`).
@@ -40,6 +41,7 @@ Menu de l'extension → **Réglages…**, ou bouton **⚙ Réglages** dans la fe
 | Réglage | Défaut |
 |---|---|
 | URL du sidecar MediaInfo (vide = bouton masqué) | vide |
+| Dossier de départ du créateur (ensuite, le dernier chemin utilisé est retenu) | `/media/downloads` |
 | Taille des pièces | 4 MiB |
 | Format | v1 |
 | Torrent privé / démarrer le seed | oui / oui |
@@ -71,6 +73,17 @@ Puis `docker compose up -d qbit-booster-mediainfo`, et dans **Réglages…** du 
 
 Variables : `ALLOWED_ROOT` (défaut `/media`), `PORT` (8765), `MEDIAINFO_TIMEOUT` en secondes (60).
 
+### Sans Docker (seedbox)
+
+Le sidecar est un unique fichier Python sans dépendance : si `python3` et `mediainfo` sont disponibles sur le serveur, il tourne directement, et les chemins sont alors forcément les mêmes que ceux de qBittorrent.
+
+```bash
+curl -fsSL -o ~/qbit-booster-mediainfo.py https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/mediainfo-api/app.py
+ALLOWED_ROOT="$HOME/downloads" PORT=8765 nohup python3 ~/qbit-booster-mediainfo.py > ~/qbit-booster-mediainfo.log 2>&1 &
+```
+
+Sur une seedbox, ce port est en général joignable depuis Internet : voir *Sécurité* ci-dessous.
+
 ### Sécurité
 
 - Le sidecar n'a **pas d'authentification** : ne l'expose **qu'en réseau local**, jamais sur Internet.
@@ -80,6 +93,7 @@ Variables : `ALLOWED_ROOT` (défaut `/media`), `PORT` (8765), `MEDIAINFO_TIMEOUT
 
 - **Aucun bouton n'apparaît** : l'adresse du WebUI n'est pas dans les règles `@match`.
 - **Boutons en double** : l'ancien script (qbt-webui-toolbox) est encore actif, supprime-le.
+- **Demande d'identifiant / mot de passe, ou erreurs 401/404 (seedbox)** : WebUI sous un sous-chemin avec une version du script antérieure à 13.2. Mets à jour, et vérifie que le `@match` inclut le sous-chemin (`https://xxx.usbx.me/qbittorrent/*`).
 - **MediaInfo : « Injoignable »** : vérifie IP/port et que le conteneur tourne (`curl http://IP:8765/health` → `ok`).
 - **MediaInfo : « Fichier introuvable »** : chemins de montage différents entre qBittorrent et le sidecar.
 - **Éditeur de trackers lent** : qBittorrent < 5.1.
