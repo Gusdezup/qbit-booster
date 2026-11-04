@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Qbit Booster
 // @namespace    qbit-booster
-// @version      13.5
+// @version      13.8
 // @homepageURL  https://github.com/Gusdezup/qbit-booster
 // @supportURL   https://github.com/Gusdezup/qbit-booster/issues
 // @downloadURL  https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
 // @updateURL    https://raw.githubusercontent.com/Gusdezup/qbit-booster/main/qbit-booster.user.js
-// @description  Améliore le WebUI qBittorrent : créateur de torrent (taille de pièce, privé par défaut, trackers enregistrés, champ source, navigateur de fichiers), éditeur de trackers en masse, réinitialisation des filtres en un clic et MediaInfo optionnel (via le sidecar qbit-booster-mediainfo). Réglages via le menu de l'extension.
+// @description  Améliore le WebUI qBittorrent : créateur de torrent (taille de pièce, privé par défaut, trackers enregistrés, champ source, navigateur de fichiers), éditeur de trackers en masse, réinitialisation des filtres en un clic, MediaInfo optionnel (via le sidecar qbit-booster-mediainfo) et liens de partage Synology DSM optionnels. Réglages via le menu de l'extension.
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
 // @grant        GM_getValue
@@ -41,6 +41,12 @@
     private: true,
     startSeeding: true,
     hideQueueingButtons: false,
+    dsmUrl: '',                  // vide = bouton « Lien de partage » masqué
+    dsmUser: '',
+    dsmPass: '',
+    dsmPublicUrl: '',            // adresse publique des liens (vide = celle renvoyée par DSM)
+    dsmPathMap: '',              // lignes « chemin qBittorrent => chemin File Station »
+    dsmExpireDays: '',           // expiration par défaut des liens, en jours ('' = jamais)
   };
   function getSettings() { return { ...DEFAULT_SETTINGS, ...GM_getValue('gtc_settings', {}) }; }
   function setSettings(s) { GM_setValue('gtc_settings', s); }
@@ -313,6 +319,24 @@
     return (dotIndex > 0 ? base.slice(0, dotIndex) : base) + '.nfo';
   }
 
+  async function copyText(content) {
+    try {
+      await navigator.clipboard.writeText(content);
+      return true;
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = content;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e2) { /* ignoré */ }
+      ta.remove();
+      return ok;
+    }
+  }
+
   function showTextModal(text, title) {
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100001;display:flex;align-items:center;justify-content:center;';
@@ -334,19 +358,7 @@
 
     const copyBtn = overlay.querySelector('#gtc-mi-copy');
     copyBtn.onclick = async () => {
-      const content = pre.textContent;
-      try {
-        await navigator.clipboard.writeText(content);
-      } catch (e) {
-        const ta = document.createElement('textarea');
-        ta.value = content;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        ta.remove();
-      }
+      await copyText(pre.textContent);
       const original = copyBtn.textContent;
       copyBtn.textContent = 'Copié ✔';
       setTimeout(() => { copyBtn.textContent = original; }, 1500);
@@ -727,6 +739,284 @@
       applyBtn.textContent = `Terminé : ${ok} modifié(s), ${skipped} ignoré(s), ${failed} échec(s)`;
       applyBtn.disabled = false;
       applyBtn.onclick = () => overlay.remove();
+    };
+  }
+
+  // ---------- Liens de partage Synology DSM (optionnel) ----------
+  // Appelle l'API Web de DSM (SYNO.API.Auth + SYNO.FileStation.Sharing) via GM_xmlhttpRequest :
+  // pas de CSP ni de CORS, et « anonymous » pour ne pas mêler la session DSM éventuellement
+  // ouverte dans le navigateur. Le compte DSM est stocké dans le stockage local de l'extension :
+  // utilise un compte dédié, sans 2FA, limité à File Station et aux dossiers à partager.
+  function getDsmUrl() { return String(getSettings().dsmUrl || '').trim().replace(/\/+$/, ''); }
+
+  function gmRequest(method, url, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method, url, timeout: 20000, anonymous: true,
+        headers: body ? { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } : {},
+        data: body ? body.toString() : undefined,
+        onload: r => resolve(r),
+        onerror: () => reject(new Error('DSM injoignable (adresse, port, ou certificat HTTPS invalide pour cette adresse ?)')),
+        ontimeout: () => reject(new Error('DSM : timeout')),
+      });
+    });
+  }
+
+  const DSM_COMMON_ERRORS = {
+    100: 'erreur inconnue', 101: 'paramètre invalide', 102: 'API inexistante', 103: 'méthode inexistante',
+    104: 'version d\'API non supportée', 105: 'permission refusée (droits du compte DSM)',
+    106: 'session expirée', 107: 'session interrompue', 119: 'session invalide',
+  };
+  const DSM_AUTH_ERRORS = {
+    400: 'identifiant ou mot de passe incorrect', 401: 'compte désactivé', 402: 'permission refusée',
+    403: 'ce compte a la double authentification (2FA) : utilise un compte dédié sans 2FA',
+    404: 'code 2FA refusé', 406: 'la 2FA est imposée à ce compte : utilise un compte qui en est exempté',
+    407: 'adresse IP bloquée par DSM après trop d\'échecs (Panneau de configuration > Sécurité > Protection)',
+    408: 'mot de passe expiré', 409: 'mot de passe expiré', 410: 'mot de passe à changer',
+  };
+  const DSM_FS_ERRORS = {
+    400: 'paramètre invalide', 402: 'NAS trop occupé', 403: 'utilisateur invalide',
+    407: 'opération non permise (le compte a-t-il le droit de partager ? File Station > Paramètres)',
+    408: 'fichier ou dossier introuvable côté File Station (vérifie la correspondance des chemins)',
+  };
+  function dsmError(code, table) {
+    const msg = (table && table[code]) || DSM_COMMON_ERRORS[code] || 'erreur';
+    const e = new Error('DSM : ' + msg + ' (code ' + code + ')');
+    e.dsmCode = code;
+    return e;
+  }
+
+  // Session DSM en mémoire (le temps de l'onglet) ; reconnexion automatique si elle expire.
+  const dsm = { base: null, apis: null, sid: null };
+  function dsmReset() { dsm.base = null; dsm.apis = null; dsm.sid = null; }
+
+  async function dsmApis() {
+    const base = getDsmUrl();
+    if (!base) throw new Error('Aucune adresse DSM configurée (Réglages…).');
+    if (dsm.apis && dsm.base === base) return dsm.apis;
+    const url = base + '/webapi/query.cgi?api=SYNO.API.Info&version=1&method=query&query=SYNO.API.Auth,SYNO.FileStation.Sharing';
+    const r = await gmRequest('GET', url);
+    let j;
+    try { j = JSON.parse(r.responseText); } catch (e) { throw new Error('Réponse inattendue de ' + base + ' (HTTP ' + r.status + ') : est-ce bien l\'adresse de DSM ?'); }
+    if (!j.success) throw dsmError(j.error && j.error.code);
+    const auth = j.data['SYNO.API.Auth'], share = j.data['SYNO.FileStation.Sharing'];
+    if (!auth || !share) throw new Error('DSM : API File Station absente (File Station est-il installé ?)');
+    dsm.base = base;
+    dsm.sid = null;
+    dsm.apis = {
+      auth: { path: auth.path, version: Math.min(auth.maxVersion, 6) },
+      share: { path: share.path, version: Math.min(share.maxVersion, 3) },
+    };
+    return dsm.apis;
+  }
+
+  async function dsmPost(api, apiName, method, params, errTable) {
+    const body = new URLSearchParams({ api: apiName, version: String(api.version), method, ...params });
+    const r = await gmRequest('POST', dsm.base + '/webapi/' + api.path, body);
+    let j;
+    try { j = JSON.parse(r.responseText); } catch (e) { throw new Error('DSM : réponse illisible (HTTP ' + r.status + ')'); }
+    if (!j.success) throw dsmError(j.error && j.error.code, errTable);
+    return j.data;
+  }
+
+  async function dsmLogin() {
+    const apis = await dsmApis();
+    const s = getSettings();
+    if (!s.dsmUser || !s.dsmPass) throw new Error('Compte DSM non renseigné (Réglages…).');
+    const data = await dsmPost(apis.auth, 'SYNO.API.Auth', 'login', {
+      account: s.dsmUser, passwd: s.dsmPass, session: 'FileStation', format: 'sid',
+    }, DSM_AUTH_ERRORS);
+    dsm.sid = data.sid;
+    return dsm.sid;
+  }
+
+  // Appel authentifié, avec une reconnexion si la session a expiré (106/107/119).
+  async function dsmAuthed(apiKey, apiName, method, params, errTable) {
+    const apis = await dsmApis();
+    if (!dsm.sid) await dsmLogin();
+    try {
+      return await dsmPost(apis[apiKey], apiName, method, { ...params, _sid: dsm.sid }, errTable);
+    } catch (e) {
+      if (![106, 107, 119].includes(e.dsmCode)) throw e;
+      await dsmLogin();
+      return dsmPost(apis[apiKey], apiName, method, { ...params, _sid: dsm.sid }, errTable);
+    }
+  }
+
+  async function dsmCreateShareLink(path, password, dateExpired) {
+    // DSM lit les paramètres en JSON quand c'est possible : une date brute (2026-11-11, JSON
+    // invalide) est ignorée et un mot de passe tout en chiffres deviendrait un nombre. On les
+    // envoie donc en chaînes JSON ("…"), comme le fait l'interface de File Station.
+    const params = {};
+    if (password) params.password = JSON.stringify(password);
+    if (dateExpired) params.date_expired = JSON.stringify(dateExpired);
+    let data;
+    try {
+      // Tableau JSON : évite que DSM découpe un nom contenant une virgule (séparateur de la
+      // forme simple). Repli sur la forme simple si cette version de DSM refuse le tableau.
+      data = await dsmAuthed('share', 'SYNO.FileStation.Sharing', 'create',
+        { ...params, path: JSON.stringify([path]) }, DSM_FS_ERRORS);
+    } catch (e) {
+      if (![101, 400].includes(e.dsmCode)) throw e;
+      data = await dsmAuthed('share', 'SYNO.FileStation.Sharing', 'create',
+        { ...params, path }, DSM_FS_ERRORS);
+    }
+    const link = data && data.links && data.links[0];
+    if (!link || !link.url) throw new Error('DSM n\'a renvoyé aucun lien');
+    if (link.error) throw dsmError(link.error, DSM_FS_ERRORS);
+    // Relit le lien pour afficher ce que DSM a réellement enregistré (la réponse de « create »
+    // ne reflète pas toujours l'expiration ni le mot de passe).
+    let saved = link;
+    if (link.id) {
+      try {
+        const info = await dsmAuthed('share', 'SYNO.FileStation.Sharing', 'getinfo',
+          { id: JSON.stringify(link.id) }, DSM_FS_ERRORS);
+        if (info && info.url) saved = { ...link, ...info };
+      } catch (e) { /* on garde la réponse de create */ }
+    }
+    return { ...saved, url: publicShareUrl(saved) };
+  }
+
+  // DSM construit l'URL du lien avec son propre nom d'hôte (souvent l'IP locale, ou gofile.me
+  // via QuickConnect). Si une adresse publique est réglée, on reconstruit le lien dessus :
+  // https://domaine/sharing/<id> (l'id est le même quel que soit l'hôte renvoyé par DSM).
+  function publicShareUrl(link) {
+    const pub = String(getSettings().dsmPublicUrl || '').trim().replace(/\/+$/, '');
+    if (!pub) return link.url;
+    let id = link.id;
+    if (!id) {
+      try { id = new URL(link.url).pathname.split('/').filter(Boolean).pop(); } catch (e) { /* ignoré */ }
+    }
+    return id ? pub + '/sharing/' + id : link.url;
+  }
+
+  // Correspondance des chemins : « /media => /usbshare/media », une règle par ligne, la plus
+  // longue l'emporte. Le chemin vu par qBittorrent (conteneur) devient le chemin File Station
+  // (/dossier-partagé/…).
+  function parsePathMap(text) {
+    return String(text || '').split('\n').map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'))
+      .map(l => {
+        const parts = l.split(/\s*=>\s*/);
+        if (parts.length !== 2 || !parts[0].startsWith('/') || !parts[1].startsWith('/')) return null;
+        return { from: parts[0].replace(/\/+$/, ''), to: parts[1].replace(/\/+$/, '') };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.from.length - a.from.length);
+  }
+  function mapToDsmPath(qbtPath) {
+    const p = String(qbtPath || '').replace(/(.)\/+$/, '$1');
+    for (const r of parsePathMap(getSettings().dsmPathMap)) {
+      if (p === r.from || p.startsWith(r.from + '/')) return (r.to + p.slice(r.from.length)) || '/';
+    }
+    return null;
+  }
+
+  function isoDateInDays(days) {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  async function torrentContentPath(t) {
+    if (t.content_path) return t.content_path;
+    const props = await (await apiFetch('torrents/properties?hash=' + t.hash)).json();
+    return (props.save_path || '').replace(/\/+$/, '') + '/' + t.name;
+  }
+
+  async function openShareDialog(torrent) {
+    const s = getSettings();
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100000;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+      <div style="${panelStyle('560px')}">
+        <h3 style="margin:0 0 8px;">Lien de partage DSM</h3>
+        <div id="gtc-sh-name" style="color:${C.muted};word-break:break-all;margin-bottom:10px;"></div>
+        <label>Chemin File Station <span style="color:${C.muted};">(/dossier-partagé/…)</span></label>
+        <input id="gtc-sh-path" style="${inputStyle('width:100%;box-sizing:border-box;margin:4px 0 4px;font-family:monospace;')}" autocomplete="off">
+        <div id="gtc-sh-qbt" style="color:${C.muted};font-size:11px;word-break:break-all;margin-bottom:10px;"></div>
+        <div style="display:flex;gap:10px;margin-bottom:10px;">
+          <div style="flex:1;">
+            <label>Mot de passe <span style="color:${C.muted};">(optionnel)</span></label>
+            <input id="gtc-sh-pass" type="text" style="${inputStyle('width:100%;box-sizing:border-box;margin-top:4px;')}" autocomplete="off">
+          </div>
+          <div style="flex:1;">
+            <label>Expire le <span style="color:${C.muted};">(vide = jamais)</span></label>
+            <input id="gtc-sh-exp" type="date" style="${inputStyle('width:100%;box-sizing:border-box;margin-top:4px;color-scheme:dark;')}">
+          </div>
+        </div>
+        <div id="gtc-sh-status" style="min-height:18px;color:${C.muted};word-break:break-all;"></div>
+        <div id="gtc-sh-result" style="display:none;gap:6px;margin-top:6px;">
+          <input id="gtc-sh-url" readonly style="${inputStyle('flex:1;box-sizing:border-box;font-family:monospace;')}">
+          <button id="gtc-sh-copy" type="button" style="${btnStyle()}">Copier</button>
+        </div>
+        <div style="text-align:right;margin-top:12px;">
+          <button id="gtc-sh-close" type="button" style="${btnStyle()}">Fermer</button>
+          <button id="gtc-sh-create" type="button" style="${btnStyle()}">Créer le lien</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector('#gtc-sh-close').onclick = () => overlay.remove();
+    overlay.querySelector('#gtc-sh-name').textContent = torrent.name;
+    const pathInput = overlay.querySelector('#gtc-sh-path');
+    const qbtLine = overlay.querySelector('#gtc-sh-qbt');
+    const status = overlay.querySelector('#gtc-sh-status');
+    const days = parseInt(s.dsmExpireDays, 10);
+    if (days > 0) overlay.querySelector('#gtc-sh-exp').value = isoDateInDays(days);
+
+    try {
+      const qbtPath = await torrentContentPath(torrent);
+      const mapped = mapToDsmPath(qbtPath);
+      qbtLine.textContent = 'Chemin qBittorrent : ' + qbtPath;
+      if (mapped) pathInput.value = mapped;
+      else {
+        pathInput.value = qbtPath;
+        status.textContent = 'Aucune règle de correspondance ne couvre ce chemin : corrige-le à la main ou ajoute une règle dans les Réglages.';
+        status.style.color = '#f29900';
+      }
+    } catch (e) {
+      status.textContent = 'Erreur qBittorrent : ' + e.message;
+    }
+
+    const createBtn = overlay.querySelector('#gtc-sh-create');
+    createBtn.onclick = async () => {
+      const path = pathInput.value.trim().replace(/(.)\/+$/, '$1');
+      if (!path.startsWith('/')) { status.textContent = 'Chemin absolu requis.'; status.style.color = '#e57373'; return; }
+      createBtn.disabled = true;
+      status.textContent = 'Création du lien…'; status.style.color = C.muted;
+      try {
+        const link = await dsmCreateShareLink(path,
+          overlay.querySelector('#gtc-sh-pass').value,
+          overlay.querySelector('#gtc-sh-exp').value);
+        const result = overlay.querySelector('#gtc-sh-result');
+        const urlInput = overlay.querySelector('#gtc-sh-url');
+        urlInput.value = link.url;
+        result.style.display = 'flex';
+        const copied = await copyText(link.url);
+        const wantedPass = !!overlay.querySelector('#gtc-sh-pass').value;
+        const wantedExp = overlay.querySelector('#gtc-sh-exp').value;
+        const exp = link.date_expired && link.date_expired !== '0' ? String(link.date_expired) : '';
+        const extras = [link.has_password ? 'protégé par mot de passe' : 'sans mot de passe',
+          exp ? 'expire le ' + exp : 'sans expiration'];
+        const warn = [];
+        if (wantedPass && !link.has_password) warn.push('DSM n\'a pas enregistré le mot de passe');
+        if (wantedExp && !exp) warn.push('DSM n\'a pas enregistré l\'expiration');
+        status.textContent = 'Lien créé ✔ (' + extras.join(', ') + ')' + (copied ? ' — copié dans le presse-papiers' : '') +
+          (warn.length ? ' ⚠ ' + warn.join(', ') + ' : vérifie dans File Station > Liens partagés' : '');
+        status.style.color = warn.length ? '#f29900' : '#81c995';
+        overlay.querySelector('#gtc-sh-copy').onclick = async () => {
+          const btn = overlay.querySelector('#gtc-sh-copy');
+          await copyText(urlInput.value);
+          btn.textContent = 'Copié ✔';
+          setTimeout(() => { btn.textContent = 'Copier'; }, 1500);
+        };
+        urlInput.onfocus = () => urlInput.select();
+      } catch (e) {
+        status.textContent = e.message;
+        status.style.color = '#e57373';
+      }
+      createBtn.disabled = false;
     };
   }
 
@@ -1326,6 +1616,46 @@
     return true;
   }
 
+  // Icône « maillon de chaîne » en rond violet, pour le bouton Lien de partage DSM
+  const SHARE_ICON_DATAURI = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">' +
+    '<circle cx="12" cy="12" r="10" fill="#8e5cd9"/>' +
+    '<path d="M10.6 13.4a2.6 2.6 0 0 0 3.7 0l2.2-2.2a2.6 2.6 0 0 0-3.7-3.7l-.8.8" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/>' +
+    '<path d="M13.4 10.6a2.6 2.6 0 0 0-3.7 0l-2.2 2.2a2.6 2.6 0 0 0 3.7 3.7l.8-.8" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linecap="round"/></svg>'
+  );
+
+  function insertShareButton() {
+    const existing = document.getElementById('gtc-share-button');
+    if (!getDsmUrl()) { if (existing) existing.remove(); return true; }
+    if (existing) return true;
+    const anchor = document.getElementById('gtc-resetfilters-button') || document.getElementById('gtc-trackereditor-button');
+    if (!anchor) return false;
+    const a = document.createElement('a');
+    a.id = 'gtc-share-button';
+    a.style.cursor = 'pointer';
+    const img = document.createElement('img');
+    img.className = 'mochaToolButton';
+    img.title = 'Créer un lien de partage DSM';
+    img.alt = 'Lien de partage DSM';
+    img.width = 24;
+    img.height = 24;
+    img.src = SHARE_ICON_DATAURI;
+    a.appendChild(img);
+    a.onclick = async () => {
+      const row = document.querySelector('tr.selected[data-row-id]');
+      const hash = row ? row.getAttribute('data-row-id') : null;
+      if (hash) {
+        try {
+          const list = await (await apiFetch('torrents/info?hashes=' + hash)).json();
+          if (list && list[0]) { openShareDialog(list[0]); return; }
+        } catch (e) { /* repli sur le sélecteur ci-dessous */ }
+      }
+      openTorrentPicker('Lien de partage — choisir un torrent', t => openShareDialog(t));
+    };
+    anchor.after(a);
+    return true;
+  }
+
   function addFloatingFallback() {
     if (document.getElementById('gtc-open-btn')) return;
     const btn = document.createElement('button');
@@ -1347,7 +1677,8 @@
     const mediaInfoAdded = insertMediaInfoButton();
     const trackerEditorAdded = insertTrackerEditorButton();
     const resetFiltersAdded = insertResetFiltersButton();
-    if (hijacked && mediaInfoAdded && trackerEditorAdded && resetFiltersAdded) return;
+    const shareAdded = insertShareButton();
+    if (hijacked && mediaInfoAdded && trackerEditorAdded && resetFiltersAdded && shareAdded) return;
     // La barre d'outils n'est pas encore prête (chargement JS de qBittorrent en cours) : on
     // réessaie brièvement, et seulement si aucun point d'ancrage n'apparaît jamais (ni bouton
     // natif, ni barre d'outils) on bascule sur le bouton flottant de secours (pour le créateur
@@ -1359,7 +1690,8 @@
       const b = insertMediaInfoButton();
       const c = insertTrackerEditorButton();
       const d = insertResetFiltersButton();
-      if ((a && b && c && d) || tries > 20) {
+      const e = insertShareButton();
+      if ((a && b && c && d && e) || tries > 20) {
         clearInterval(iv);
         if (!creatorAnchor()) addFloatingFallback();
       }
@@ -1395,7 +1727,7 @@
     overlay.id = 'gtc-settings-overlay';
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100003;display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
-      <div style="${panelStyle('480px')}">
+      <div style="${panelStyle('480px')}max-height:90vh;overflow:auto;box-sizing:border-box;">
         <h3 style="margin-top:0;">Réglages</h3>
 
         <label>URL du sidecar MediaInfo <span style="color:${C.muted};">(vide = bouton MediaInfo masqué)</span></label>
@@ -1418,6 +1750,22 @@
         <label><input type="checkbox" id="gtc-set-seed"${s.startSeeding ? ' checked' : ''}> Démarrer le seed par défaut</label><br>
         <label><input type="checkbox" id="gtc-set-queue"${s.hideQueueingButtons ? ' checked' : ''}> Masquer les flèches de file d'attente dans la barre d'outils</label>
 
+        <h4 style="margin:16px 0 6px;border-top:1px solid ${C.border};padding-top:12px;">Liens de partage Synology DSM <span style="color:${C.muted};font-weight:normal;">(optionnel)</span></h4>
+        <label>Adresse de DSM <span style="color:${C.muted};">(vide = bouton masqué)</span></label>
+        <input id="gtc-set-dsm-url" style="${inputStyle('width:100%;box-sizing:border-box;margin:4px 0 10px;')}" placeholder="https://nas.exemple.fr ou http://192.168.1.10:5000" autocomplete="off">
+        <div style="display:flex;gap:6px;margin-bottom:4px;">
+          <input id="gtc-set-dsm-user" style="${inputStyle('flex:1;box-sizing:border-box;')}" placeholder="Compte DSM (dédié, sans 2FA)" autocomplete="off">
+          <input id="gtc-set-dsm-pass" type="password" style="${inputStyle('flex:1;box-sizing:border-box;')}" placeholder="Mot de passe" autocomplete="new-password">
+          <button id="gtc-set-dsm-test" type="button" style="${btnStyle()}">Tester</button>
+        </div>
+        <div id="gtc-set-dsm-status" style="min-height:16px;font-size:12px;color:${C.muted};margin-bottom:10px;"></div>
+        <label>Adresse publique des liens <span style="color:${C.muted};">(vide = celle choisie par DSM)</span></label>
+        <input id="gtc-set-dsm-pub" style="${inputStyle('width:100%;box-sizing:border-box;margin:4px 0 10px;')}" placeholder="https://nas.exemple.fr" autocomplete="off">
+        <label>Correspondance des chemins <span style="color:${C.muted};">(qBittorrent => File Station, une par ligne)</span></label>
+        <textarea id="gtc-set-dsm-map" spellcheck="false" style="${inputStyle('width:100%;box-sizing:border-box;height:60px;margin:4px 0 10px;font-family:monospace;font-size:12px;')}" placeholder="/media => /video&#10;/downloads => /usbshare/downloads"></textarea>
+        <label>Expiration par défaut des liens <span style="color:${C.muted};">(jours, vide = jamais)</span></label>
+        <input id="gtc-set-dsm-exp" type="number" min="1" style="${inputStyle('width:100px;box-sizing:border-box;margin:4px 0 4px;display:block;')}">
+
         <div id="gtc-set-error" style="color:#e57373;min-height:16px;margin-top:10px;"></div>
         <div style="text-align:right;margin-top:6px;">
           <button id="gtc-set-cancel" style="${btnStyle()}">Annuler</button>
@@ -1429,6 +1777,18 @@
     miInput.value = s.mediainfoApi || ''; // via .value : pas d'injection dans le HTML
     const pathInput = overlay.querySelector('#gtc-set-path');
     pathInput.value = s.defaultPath || '';
+    const dsmUrlInput = overlay.querySelector('#gtc-set-dsm-url');
+    const dsmUserInput = overlay.querySelector('#gtc-set-dsm-user');
+    const dsmPassInput = overlay.querySelector('#gtc-set-dsm-pass');
+    const dsmMapInput = overlay.querySelector('#gtc-set-dsm-map');
+    const dsmPubInput = overlay.querySelector('#gtc-set-dsm-pub');
+    dsmPubInput.value = s.dsmPublicUrl || '';
+    const dsmExpInput = overlay.querySelector('#gtc-set-dsm-exp');
+    dsmUrlInput.value = s.dsmUrl || '';
+    dsmUserInput.value = s.dsmUser || '';
+    dsmPassInput.value = s.dsmPass || '';
+    dsmMapInput.value = s.dsmPathMap || '';
+    dsmExpInput.value = s.dsmExpireDays || '';
     overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
     overlay.querySelector('#gtc-set-cancel').onclick = () => overlay.remove();
 
@@ -1448,6 +1808,30 @@
       }
     };
 
+    // Test DSM : connexion avec les valeurs saisies (pas encore enregistrées), puis on remet la
+    // session à zéro pour que les vrais réglages soient utilisés ensuite.
+    const dsmStatus = overlay.querySelector('#gtc-set-dsm-status');
+    overlay.querySelector('#gtc-set-dsm-test').onclick = async () => {
+      const url = dsmUrlInput.value.trim().replace(/\/+$/, '');
+      const err = url ? validateHttpUrl(url) : 'Renseigne l\'adresse de DSM';
+      if (err) { dsmStatus.textContent = err; dsmStatus.style.color = '#e57373'; return; }
+      dsmStatus.textContent = 'Connexion…'; dsmStatus.style.color = C.muted;
+      const saved = getSettings();
+      setSettings({ ...saved, dsmUrl: url, dsmUser: dsmUserInput.value.trim(), dsmPass: dsmPassInput.value });
+      dsmReset();
+      try {
+        await dsmLogin();
+        dsmStatus.textContent = 'Connexion DSM réussie ✔';
+        dsmStatus.style.color = '#81c995';
+      } catch (e) {
+        dsmStatus.textContent = e.message;
+        dsmStatus.style.color = '#e57373';
+      } finally {
+        setSettings(saved);
+        dsmReset();
+      }
+    };
+
     overlay.querySelector('#gtc-set-save').onclick = () => {
       const mediainfoApi = miInput.value.trim().replace(/\/+$/, '');
       const err = validateHttpUrl(mediainfoApi);
@@ -1461,6 +1845,20 @@
       // Nouveau dossier de départ : il remplace aussi le dernier chemin mémorisé, pour prendre
       // effet dès la prochaine ouverture du créateur.
       if (defaultPath !== (s.defaultPath || '')) setDefaultPath(defaultPath);
+      const dsmUrl = dsmUrlInput.value.trim().replace(/\/+$/, '');
+      const dsmErr = validateHttpUrl(dsmUrl);
+      if (dsmErr) { overlay.querySelector('#gtc-set-error').textContent = 'DSM : ' + dsmErr; return; }
+      const dsmPublicUrl = dsmPubInput.value.trim().replace(/\/+$/, '');
+      const pubErr = validateHttpUrl(dsmPublicUrl);
+      if (pubErr) { overlay.querySelector('#gtc-set-error').textContent = 'Adresse publique : ' + pubErr; return; }
+      const dsmPathMap = dsmMapInput.value.trim();
+      const badLine = dsmPathMap.split('\n').map(l => l.trim())
+        .find(l => l && !l.startsWith('#') && !parsePathMap(l).length);
+      if (badLine) {
+        overlay.querySelector('#gtc-set-error').textContent = 'Règle de chemin invalide : « ' + badLine + ' » (format : /chemin/qbit => /dossier-partagé/…)';
+        return;
+      }
+      const expDays = parseInt(dsmExpInput.value, 10);
       setSettings({
         mediainfoApi,
         defaultPath,
@@ -1469,10 +1867,18 @@
         private: overlay.querySelector('#gtc-set-private').checked,
         startSeeding: overlay.querySelector('#gtc-set-seed').checked,
         hideQueueingButtons: overlay.querySelector('#gtc-set-queue').checked,
+        dsmUrl,
+        dsmUser: dsmUserInput.value.trim(),
+        dsmPass: dsmPassInput.value,
+        dsmPublicUrl,
+        dsmPathMap,
+        dsmExpireDays: expDays > 0 ? expDays : '',
       });
+      dsmReset();
       applyQueueingStyle();
       insertMediaInfoButton();   // ajoute ou retire le bouton selon l'URL
       insertTrackerEditorButton();
+      insertShareButton();
       overlay.remove();
     };
   }

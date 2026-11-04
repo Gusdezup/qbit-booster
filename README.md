@@ -5,6 +5,7 @@ Userscript (Violentmonkey / Tampermonkey) qui ajoute au WebUI de qBittorrent :
 - **Créateur de torrent amélioré** — remplace la fenêtre native (ou ajoute le bouton si le WebUI n'en a pas) : taille de pièce, format v1/v2/hybride, privé par défaut, trackers enregistrés (nom, URL, champ *source*), navigateur de fichiers avec autocomplétion, préremplissage depuis le torrent sélectionné, téléchargement du `.torrent`.
 - **Éditeur de trackers en masse** — remplace une URL d'announce sur tous les torrents concernés (sélection, filtre tracker de la barre latérale, ou toute la bibliothèque).
 - **Réinitialisation des filtres** — un clic remet État, Catégories, Étiquettes et Trackers sur « Tous » ; l'icône passe en orange dès qu'un filtre est actif (survol = lesquels).
+- **Liens de partage Synology** *(optionnel)* — crée un lien de partage DSM (File Station) vers le contenu d'un torrent, avec mot de passe et date d'expiration, copié directement dans le presse-papiers.
 - **MediaInfo** *(optionnel)* — affiche la sortie `mediainfo` d'un fichier d'un torrent, copie ou export `.nfo`. Nécessite le petit conteneur `qbit-booster-mediainfo`.
 
 ## Prérequis
@@ -46,6 +47,7 @@ Menu de l'extension → **Réglages…**, ou bouton **⚙ Réglages** dans la fe
 | Format | v1 |
 | Torrent privé / démarrer le seed | oui / oui |
 | Masquer les flèches de file d'attente | non |
+| Liens de partage DSM : adresse, compte, correspondance des chemins, expiration par défaut | vide (bouton masqué) |
 
 ## MediaInfo (optionnel)
 
@@ -89,6 +91,25 @@ Sur une seedbox, ce port est en général joignable depuis Internet : voir *Séc
 - Le sidecar n'a **pas d'authentification** : ne l'expose **qu'en réseau local**, jamais sur Internet.
 - Il refuse tout chemin hors de `ALLOWED_ROOT` (liens symboliques et `..` résolus) et ne lit que des fichiers. Monte les médias en lecture seule (`:ro`).
 
+## Liens de partage Synology (optionnel)
+
+Si tes fichiers sont sur un NAS Synology, le bouton violet (maillon) crée un lien de partage File Station pour le torrent sélectionné (ou choisi dans une liste), sans passer par DSM.
+
+Dans **Réglages…** :
+
+- **Adresse de DSM** : par ex. `https://nas.exemple.fr` ou `http://192.168.1.10:5000`. En HTTPS, l'adresse doit correspondre au certificat (une IP avec un certificat de domaine échoue).
+- **Compte DSM** : crée un compte **dédié, sans 2FA**, avec seulement l'application File Station et l'accès en lecture aux dossiers partagés concernés. Le mot de passe est stocké dans l'extension, en local dans ton navigateur.
+- **Correspondance des chemins** : qBittorrent voit les chemins du conteneur, File Station ceux des dossiers partagés. Une règle par ligne, la plus longue l'emporte :
+
+  ```
+  /media => /video
+  /downloads => /usbshare/downloads
+  ```
+
+  Le chemin calculé reste modifiable dans la fenêtre avant de créer le lien.
+
+- **Adresse publique des liens** *(optionnel)* : DSM met dans ses liens son propre nom d'hôte (souvent l'IP locale, ou `gofile.me` avec QuickConnect). Renseigne par ex. `https://nas.exemple.fr` pour que le script envoie `https://nas.exemple.fr/sharing/<id>`. Cette adresse doit mener à DSM depuis Internet (port 443 ouvert + reverse proxy vers DSM si besoin).
+
 ## Dépannage
 
 - **Aucun bouton n'apparaît** : l'adresse du WebUI n'est pas dans les règles `@match`.
@@ -97,6 +118,8 @@ Sur une seedbox, ce port est en général joignable depuis Internet : voir *Séc
 - **MediaInfo : « Injoignable »** : vérifie IP/port et que le conteneur tourne (`curl http://IP:8765/health` → `ok`).
 - **MediaInfo : « Fichier introuvable »** : chemins de montage différents entre qBittorrent et le sidecar.
 - **Éditeur de trackers lent** : qBittorrent < 5.1.
+- **Lien DSM : « fichier ou dossier introuvable »** : la règle de correspondance ne donne pas le bon chemin File Station (il commence par le nom du dossier partagé, pas par `/volume1`).
+- **Lien DSM : « double authentification »** : le compte a la 2FA ; utilise un compte dédié qui en est exempté.
 
 ## Licence
 
